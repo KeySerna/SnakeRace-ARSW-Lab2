@@ -1,0 +1,3 @@
+co\eci\snake\core\engine\PauseControllerTest.class
+co\eci\snake\concurrency\BoardConcurrencyTest.class
+co\eci\snake\core\SnakeThreadSafetyTest.class
