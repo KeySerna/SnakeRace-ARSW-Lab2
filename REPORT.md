@@ -1,210 +1,250 @@
-# Reporte de Laboratorio 2 — Programación concurrente (ARSW)
+# Reporte de Laboratorio 2 — Programación Concurrente (ARSW)
 
-Escuela Colombiana de Ingeniería Julio Garavito — Arquitecturas de Software
-
----
-
-## Parte I — Calentamiento: wait/notify (PrimeFinder)
-
-El código de `PrimeFinder.java` (entregado en el repositorio de la Parte I,
-paquete `edu.eci.arsw.primefinder`) implementa `N` hilos trabajadores que
-buscan números primos indefinidamente sobre un contador compartido
-(`AtomicInteger nextCandidate`), y un hilo controlador (el hilo `main`) que,
-cada `t` milisegundos:
-
-1. Pausa a todos los trabajadores.
-2. Espera (bloqueado, sin sondeo) a que **todos** confirmen estar detenidos.
-3. Imprime cuántos primos se han encontrado hasta ese instante.
-4. Bloquea esperando `ENTER` por consola.
-5. Reanuda a todos los trabajadores.
-
-### Diseño de sincronización
-
-- **Un único monitor**: la instancia de la clase interna `PauseGate`
-  (concretamente su campo `lock`). Todo el estado compartido relacionado con
-  pausa/reanudación (`paused`, `parked`, `totalWorkers`) se protege con ese
-  mismo lock — un solo candado para todo el estado relacionado, evitando la
-  necesidad de sincronizar entre varios locks distintos.
-- **Condición de espera de los trabajadores**: `while (paused) lock.wait();`
-  dentro de `checkpoint()`. Cada trabajador la evalúa una vez por iteración
-  de su bucle.
-- **Condición de espera del controlador**: `while (parked < totalWorkers)
-  lock.wait();` dentro de `pauseAndAwaitAllParked()`.
-- **Cómo se evitan los "lost wakeups"**: tanto la comprobación de la
-  condición como la llamada a `wait()` ocurren **dentro del mismo bloque
-  `synchronized`**, sobre el mismo lock que usa quien hace `notifyAll()`. Si
-  un hilo pudiera comprobar la condición y luego bloquear en `wait()` en dos
-  pasos no atómicos, un `notifyAll()` emitido justo en medio se perdería
-  (el hilo ya habría decidido esperar, pero nadie lo despertaría después).
-  Al mantener comprobación + `wait()` atómicas respecto al lock, esto es
-  imposible: mientras un hilo tiene el lock (para comprobar/decidir
-  esperar), ningún otro hilo puede tener el lock para notificar.
-- **`while` en vez de `if`**: protege contra *spurious wakeups* (permitidos
-  por el JLS) y contra que `notifyAll()` despierte a un hilo cuya condición
-  real todavía no se cumple (por ejemplo, el controlador puede despertar por
-  el `notifyAll()` de un trabajador que se acaba de "parquear" sin que
-  todavía se hayan parqueado los demás).
-- **Sin espera activa**: en ningún punto se hace *polling* de una bandera en
-  un bucle con `Thread.sleep` corto; todo bloqueo ocurre vía `wait()`.
+**Escuela Colombiana de Ingeniería Julio Garavito — Arquitecturas de Software**
+**Repositorio:** `SnakeRace-ARSW-Lab2`
 
 ---
 
-## Parte II — SnakeRace concurrente
+## 1. Introducción
 
-### 1) Cómo el código usa hilos para dar autonomía a cada serpiente
+Este laboratorio parte de una versión funcional pero **concurrentemente
+insegura** del juego SnakeRace: cada serpiente se mueve en su propio hilo,
+pero el código no protege correctamente el estado que esos hilos comparten
+entre sí y con la interfaz gráfica (Swing). El objetivo del laboratorio es
+identificar esos puntos de riesgo (condiciones de carrera, colecciones no
+seguras, esperas activas mal implementadas) y corregirlos aplicando el
+modelo de monitores de Java (`synchronized`, `wait()`, `notify()`/
+`notifyAll()`), manteniendo el alcance de cada región crítica lo más
+pequeño posible.
 
-Cada serpiente corre en su propio hilo **virtual** (`Executors.newVirtualThreadPerTaskExecutor()`,
-`SnakeApp` línea de arranque), ejecutando una instancia de `SnakeRunner`. Cada
-`SnakeRunner` tiene su propio bucle independiente: decide si gira
-aleatoriamente, invoca `board.step(...)` para avanzar, y duerme un tiempo
-(`Thread.sleep`) proporcional a si está en modo turbo. Al usar hilos
-virtuales, N puede ser grande (decenas o cientos) sin agotar hilos del
-sistema operativo.
+El trabajo se divide en dos partes:
 
-### 2) Data races encontradas y su solución
+- **Parte I (calentamiento):** un ejercicio aislado y más simple —
+  `PrimeFinder` — para practicar el patrón de suspensión/reanudación de
+  hilos con `wait/notify` antes de aplicarlo al problema más grande.
+- **Parte II (núcleo del laboratorio):** el análisis y corrección completa
+  de SnakeRace, incluyendo una UI de Iniciar/Pausar/Reanudar con
+  estadísticas consistentes.
 
-| # | Problema | Dónde | Solución |
-|---|----------|-------|----------|
-| 1 | `Snake.body` (`ArrayDeque`) se **escribía** desde el hilo de la serpiente (`advance()`, llamado dentro de `Board.step`) y se **leía** desde el hilo de Swing (EDT) en `paintComponent` (`snapshot()`, `head()`), sin ningún candado. `ArrayDeque` no es thread-safe: esto puede producir `ConcurrentModificationException`, lecturas corruptas, o publicación insegura de referencias. | `Snake.java` | Se sincronizan `advance()`, `snapshot()`, `head()`, `length()` y el nuevo `occupies()` sobre el monitor intrínseco de la propia instancia `Snake`. Región mínima: solo tocan el `Deque` y el contador `maxLength`. |
-| 2 | El botón **Pausar** (antes "Action") solo llamaba a `clock.pause()`, que detiene el *ticker* de repintado (`GameClock`). Cada `SnakeRunner` seguía su propio bucle con `Thread.sleep()` **ajeno por completo** al estado de pausa: las serpientes seguían moviéndose con el juego "pausado". No es una condición de carrera en el sentido clásico, pero sí es un defecto de coordinación/consistencia entre hilos: el estado visible (tablero pausado) no correspondía al estado real (serpientes en movimiento). | `SnakeRunner.java`, `SnakeApp.java` | Se introdujo `PauseController` (ver punto 3). Cada `SnakeRunner` llama a `pauseController.awaitIfPaused()` una vez por iteración, bloqueando de verdad el avance mientras el juego está pausado. |
-| 3 | Al pausar y querer mostrar estadísticas ("serpiente más larga viva", "primera en morir"), leer el estado de las serpientes justo después de pedir la pausa podría capturar una **foto a medias** (*tearing*): algunas serpientes ya detenidas, otras todavía terminando su `step()` actual, porque la suspensión de un hilo nunca es instantánea. | `SnakeApp.togglePause()` | `PauseController.awaitAllParked(timeoutMs)` bloquea al llamante hasta que **todos** los `SnakeRunner` registrados confirman (vía `wait/notify`, no sondeo) que están parqueados, antes de calcular las estadísticas. Si se agota el timeout (posible bajo carga extrema), se muestran igual las estadísticas con una advertencia explícita en vez de bloquear indefinidamente o fallar. |
+---
 
-### 3) Colecciones o estructuras no seguras en contexto concurrente
+## 2. Parte I — Calentamiento: control de hilos con wait/notify
 
-- `Snake.body` (`ArrayDeque<Position>`) — descrito arriba; corregido con
-  sincronización sobre el monitor de `Snake`.
-- `Board.mice/obstacles/turbo` (`HashSet`) y `Board.teleports` (`HashMap`) —
-  **ya estaban** protegidas correctamente en el starter: todos los métodos
-  que las tocan (`step`, `mice()`, `obstacles()`, `turbo()`, `teleports()`)
-  son `synchronized` sobre `Board`, y los getters devuelven **copias**
-  defensivas (`new HashSet<>(mice)`, etc.), así que la UI nunca itera
-  directamente la colección "viva". Se mantuvo este diseño.
-- Nueva estructura introducida — `deathOrder`: como varias serpientes pueden
-  morir "al mismo tiempo" (hilos distintos), se necesita una estructura
-  segura para registrar el orden de muerte. Se usó
-  `java.util.concurrent.ConcurrentLinkedQueue<Snake>` (cola no bloqueante,
-  basada en el algoritmo de Michael-Scott) en lugar de una `ArrayList`
-  sincronizada, para no introducir un lock adicional que compita con el de
-  `Board` y porque el único uso es "agregar" (`offer`) concurrente y "leer
-  el primero" (`peek`), exactamente el caso de uso de esta colección.
-- La lista de serpientes (`allSnakes`, pasada a cada `SnakeRunner`) se
-  publica como `List.copyOf(snakes)` — inmutable — porque su **identidad**
-  (qué instancias contiene) nunca cambia tras arrancar el juego; solo el
-  estado interno de cada `Snake` cambia, y ese estado ya está protegido
-  individualmente. Esto evita tener que sincronizar también el acceso a la
-  lista misma.
+### 2.1 Qué se implementó
 
-### 4) Esperas activas (busy-wait) identificadas
+`PrimeFinder.java` lanza **N hilos trabajadores** que buscan números primos
+indefinidamente, tomando cada uno el siguiente candidato de un contador
+compartido (`AtomicInteger`). Un hilo controlador (el `main`), cada `t`
+milisegundos, pausa a todos los trabajadores, espera a que confirmen que
+están detenidos, imprime cuántos primos se han encontrado, y bloquea
+esperando `ENTER` por consola antes de reanudar.
 
-El starter no tenía bucles de sondeo explícitos (`while (!condicion) {}`
-sin bloqueo), pero sí tenía el problema equivalente descrito en el punto 2
-de la tabla: un mecanismo de "pausa" que no bloqueaba realmente a los hilos
-de movimiento, sino que los dejaba correr libremente ignorando el estado.
-Se sustituyó por `PauseController`, que bloquea con `wait()` (cero consumo
-de CPU mientras está pausado) y despierta con `notifyAll()` — el mismo
-patrón usado en la Parte I.
+### 2.2 Diseño de sincronización
 
-### 5) Regiones críticas y su justificación
+**Qué lock se usa:** un único monitor, la instancia de la clase interna
+`PauseGate` (concretamente su campo `lock`). Se decidió usar **un solo
+candado** para todo el estado relacionado con pausa/reanudación
+(`paused`, `parked`, `totalWorkers`) en vez de varios candados, porque esas
+tres variables cambian juntas y de forma dependiente: separarlas en locks
+distintos habría obligado a coordinarlos entre sí, complicando el diseño
+sin ninguna ganancia de paralelismo real (la pausa es, por naturaleza, un
+punto de sincronización global).
 
-- **`Board.step(...)`**: sigue siendo el único método `synchronized` que
-  toca el estado compartido del tablero (ratones, obstáculos, turbo,
-  teletransportadores) y ahora también decide colisiones entre serpientes.
-  Se mantiene como región crítica **completa** (no se intentó partirla en
-  candados más finos) porque:
-  - Solo se ejecuta una vez por iteración de cada `SnakeRunner` (no es un
-    método "caliente" llamado en un bucle ajustado sin `sleep`).
-  - Al ser un único lock, **serializa** el movimiento de todas las
-    serpientes (una avanza a la vez), lo cual es precisamente lo que
-    garantiza que dos serpientes no puedan "pisar" la misma celda de forma
-    inconsistente ni que dos hilos decidan la muerte de una tercera
-    serpiente en instantes contradictorios.
-  - Lo que **no** está dentro del lock: la decisión de girar aleatoriamente
-    (`randomTurn()`) y el `Thread.sleep(...)` de cada `SnakeRunner` — así,
-    ningún hilo mantiene el lock de `Board` mientras duerme.
-- **`Snake` (métodos sobre `body`)**: región mínima, solo las 4-5 líneas que
-  tocan el `Deque`; el resto de la clase (dirección, estado vivo/muerto) usa
-  campos `volatile` en vez de synchronized, porque son lecturas/escrituras
-  atómicas de una única referencia/booleano que no requieren un lock.
-- **`PauseController`**: un único lock (`lock`) protege tres variables de
-  estado pequeñas y estrechamente relacionadas (`paused`, `registered`,
-  `parked`); no tiene sentido partirlo en varios candados porque casi todas
-  las operaciones necesitan leer/escribir más de una de esas variables de
-  forma atómica entre sí.
-- **Orden de adquisición de locks / ausencia de deadlock**: dentro de
-  `Board.step(...)` (con el lock de `Board` ya tomado) se llama a
-  `other.occupies(...)` de otras serpientes, lo que internamente toma el
-  lock de esa `Snake`. Como `Board` es `synchronized` como un todo, **nunca
-  hay dos hilos dentro de `step()` a la vez**, así que nunca hay dos hilos
-  intentando tomar el par de locks (Board, Snake) en órdenes distintos al
-  mismo tiempo → no hay riesgo de deadlock por orden de adquisición de
-  locks anidados.
+**Qué condición se espera:**
+- Cada trabajador espera `while (paused) lock.wait();` dentro de
+  `checkpoint()` — se llama una vez por iteración de su bucle de búsqueda.
+- El controlador espera `while (parked < totalWorkers) lock.wait();`
+  dentro de `pauseAndAwaitAllParked()`.
 
-### 6) Control de ejecución seguro (UI): Pausar / Reanudar
+**Cómo se evitan los "lost wakeups":** la regla aplicada es que la
+comprobación de la condición y la llamada a `wait()` **nunca se separan**:
+ambas ocurren dentro del mismo bloque `synchronized`, sobre el mismo lock
+que usa quien más tarde llama a `notifyAll()`. Si se comprobara la
+condición fuera del bloque sincronizado y solo se entrara al monitor para
+llamar a `wait()`, existiría una ventana de tiempo en la que otro hilo
+podría cambiar el estado y notificar *antes* de que el primer hilo
+alcanzara a bloquearse — esa notificación se perdería y el hilo quedaría
+esperando para siempre. Al mantener todo dentro de una única sección
+crítica esto es imposible: mientras un hilo tiene el lock para decidir si
+espera, ningún otro hilo puede tener el lock para notificar.
 
-- `PauseController.pause()` marca el estado global como pausado.
-- Cada `SnakeRunner` respeta ese estado en `awaitIfPaused()` (bloqueo real,
-  sin busy-wait).
-- `SnakeApp.togglePause()`, tras pedir la pausa, lanza un hilo virtual
-  auxiliar que llama a `pauseController.awaitAllParked(500)` — esto NO
-  bloquea el hilo de eventos de Swing (evita congelar la UI) — y solo
-  cuando retorna (todos parqueados, o venció el timeout) se calculan y
-  publican las estadísticas de vuelta al EDT vía `SwingUtilities.invokeLater`.
-- Estadísticas mostradas: **serpiente más larga viva** (recorriendo las
-  serpientes vivas y comparando `length()`) y **peor serpiente** (la
-  primera en `deathOrder`, es decir, la primera en morir).
-- Se probó explícitamente el caso "la suspensión no es instantánea":
-  ver `PauseControllerTest`, que verifica que `awaitAllParked` efectivamente
-  bloquea hasta que el último hilo confirma, y no antes.
+Adicionalmente se usa `while` (nunca `if`) para revisar la condición antes
+y después de cada `wait()`. Esto protege contra dos escenarios: los
+*spurious wakeups* que el JLS permite explícitamente (un hilo puede
+despertar sin que nadie haya llamado `notify`), y el caso en que
+`notifyAll()` despierta a varios hilos a la vez pero la condición real de
+cada uno todavía no se cumple (por ejemplo, el controlador puede despertar
+por el aviso de un solo trabajador que recién se "parqueó", sin que el
+resto lo haya hecho todavía).
 
-### 7) Regla de "muerte" (diseño nuevo, necesario para las estadísticas pedidas)
+**Ausencia de espera activa:** en ningún punto hay sondeo (*polling*) de
+una bandera dentro de un bucle con `sleep` corto. Todo bloqueo real ocurre
+vía `wait()`, que libera la CPU por completo hasta ser notificado.
 
-El starter original **nunca mataba serpientes** (solo rebotaban contra
-obstáculos), por lo que no existía manera de determinar una "peor
-serpiente". Se definió: una serpiente muere si la celda a la que se movería
-su cabeza está ocupada por el cuerpo de **cualquier** serpiente (incluida
-ella misma), verificado dentro de `Board.step(...)` antes de mover. Al
-morir: se marca `snake.kill()`, se agrega a `deathOrder`, su hilo
-`SnakeRunner` termina (no se deja "zombie" ocupando CPU), y deja de
-dibujarse en el tablero. Simplificación consciente: no se libera la celda
-de la cola en el mismo tick en que se movería (no se contempla "perseguir
-la propia cola"); se documenta como simplificación de diseño razonable para
-el alcance del laboratorio.
+### 2.3 Cómo correr esta parte
 
-### 8) Robustez bajo carga
+```bash
+javac PrimeFinder.java
+java edu.eci.arsw.primefinder.PrimeFinder 4 3000
+```
 
-Se agregaron pruebas en `src/test/java`:
+El primer argumento es el número de hilos trabajadores (por defecto 4), el
+segundo es el período de reporte en milisegundos (por defecto 3000). Cada
+`t` ms el programa se pausa solo, imprime el conteo de primos encontrados,
+y espera `ENTER` para continuar.
 
-- **`BoardConcurrencyTest`**: 30 serpientes en un tablero pequeño (12×12,
-  para forzar colisiones frecuentes) corriendo en hilos virtuales durante
-  1.5s, seguido de `shutdownNow()`; verifica que ningún hilo lance una
-  excepción (ninguna `ConcurrentModificationException` ni otra) y que todos
-  terminen limpiamente al ser interrumpidos.
-- **`SnakeThreadSafetyTest`**: un hilo escribe (`advance`) 20 000 veces
-  mientras otro lee (`snapshot`) 20 000 veces sobre la misma serpiente,
-  simultáneamente; verifica que no se lance ninguna excepción.
-- **`PauseControllerTest`**: 8 hilos se registran, uno principal pausa y
-  espera a que todos confirmen (`awaitAllParked`), luego reanuda y verifica
-  que todos se desbloqueen y terminen.
+---
 
-Adicionalmente (fuera del árbol de pruebas, como validación manual durante
-el desarrollo) se ejecutó una prueba de humo con **40 serpientes en un
-tablero de 12×12** ejecutando 5 ciclos de pausar → leer estadísticas →
-reanudar mientras la simulación corría en segundo plano, confirmando cero
-excepciones y consistencia del conteo de serpientes vivas/muertas en cada
+## 3. Parte II — SnakeRace concurrente
+
+### 3.1 Cómo el código da autonomía a cada serpiente
+
+Cada serpiente corre en su propio **hilo virtual**
+(`Executors.newVirtualThreadPerTaskExecutor()`), ejecutando una instancia
+independiente de `SnakeRunner`. Ese hilo decide, en su propio bucle y a su
+propio ritmo (`Thread.sleep` variable según si está en modo turbo), si gira
+aleatoriamente y cuándo invocar `Board.step(...)` para avanzar una celda.
+Usar hilos virtuales permite escalar a decenas o cientos de serpientes sin
+agotar los hilos del sistema operativo, ya que el costo de cada uno es muy
+bajo.
+
+### 3.2 Condiciones de carrera identificadas
+
+La más importante: **`Snake.body` (`ArrayDeque<Position>`) se escribía
+desde el hilo de la serpiente** (`advance()`, invocado dentro de
+`Board.step`) **y se leía desde el hilo de Swing (EDT)** al dibujar el
+tablero (`snapshot()`, `head()`), sin ningún candado. `ArrayDeque` no es
+thread-safe: este patrón puede producir `ConcurrentModificationException`,
+lecturas corruptas a mitad de una modificación, o publicación insegura de
+referencias — el riesgo es que la ventana del juego se congele con una
+excepción en cualquier momento, de forma no reproducible de manera
+determinista (justo lo que hace peligrosas a las condiciones de carrera).
+
+Un segundo problema, más sutil, de **consistencia entre hilos**: el botón
+de pausa original solo llamaba a `clock.pause()`, que detiene el *ticker*
+de repintado. Cada `SnakeRunner` seguía su bucle de movimiento por
+completo ajeno a ese estado — las serpientes seguían avanzando con el
+juego "visualmente pausado". No es una condición de carrera en el sentido
+clásico (no hay corrupción de datos), pero es un defecto real: el estado
+mostrado al usuario no correspondía al estado real de la simulación, y
+volvía inútil cualquier estadística que se intentara leer durante la
 pausa.
 
-> **Nota sobre evidencias**: al no contar con entorno gráfico, no fue
-> posible generar aquí capturas de pantalla de la ventana Swing. Al correr
-> `mvn -q -DskipTests exec:java -Dsnakes=20` en tu máquina, adjunta al
-> repositorio: (a) captura del juego corriendo con N alto, (b) captura tras
-> pulsar "Pausar" mostrando la etiqueta de estadísticas, y (c) la salida de
-> consola de `mvn clean verify` con las pruebas en verde.
+### 3.3 Colecciones o estructuras no seguras en contexto concurrente
+
+- **`Snake.body`** (`ArrayDeque`) — descrita arriba.
+- **`Board.mice` / `obstacles` / `turbo`** (`HashSet`) y
+  **`Board.teleports`** (`HashMap`) — estas **ya estaban** protegidas
+  correctamente en el punto de partida: todo método que las toca es
+  `synchronized` sobre `Board`, y los getters devuelven copias defensivas.
+  Se mantuvo ese diseño porque ya era correcto.
+- **Nueva estructura, `deathOrder`:** al agregar la mecánica de "muerte" de
+  serpientes (necesaria para las estadísticas pedidas), varias serpientes
+  pueden morir "al mismo tiempo" desde hilos distintos. Se eligió
+  `ConcurrentLinkedQueue<Snake>` — una cola no bloqueante — en lugar de una
+  `ArrayList` sincronizada, porque el único uso real es agregar (`offer`)
+  y leer el primero (`peek`), y así se evita introducir un candado
+  adicional que compita con el de `Board`.
+
+### 3.4 Esperas activas o sincronización innecesaria
+
+No había bucles de sondeo explícitos (`while(!condicion){}` sin bloqueo),
+pero sí el problema funcionalmente equivalente descrito en 3.2: un
+mecanismo de "pausa" que no bloqueaba realmente a los hilos de movimiento.
+No se detectó tampoco sincronización *innecesaria* que se pudiera eliminar
+sin perder corrección: el único `synchronized` amplio (`Board.step`) se
+justifica en la sección 3.5.
+
+### 3.5 Correcciones mínimas y regiones críticas — riesgo y solución
+
+| Cambio | Riesgo que resuelve | Cómo lo resuelve |
+|---|---|---|
+| `Snake`: sincronizar `advance()`, `snapshot()`, `head()`, `length()`, `occupies()` sobre el monitor de la propia instancia | Lectura/escritura concurrente del `ArrayDeque` del cuerpo (EDT vs. hilo de la serpiente) | Todo acceso al `Deque` pasa por una región crítica mínima: solo esas líneas, no el resto de la clase (dirección y vida siguen siendo `volatile`, sin lock, porque son lecturas/escrituras atómicas de una única referencia) |
+| Nuevo `PauseController` (`wait/notify`, mismo patrón que la Parte I) | Pausa "falsa" que no detenía el movimiento real | Cada `SnakeRunner` llama a `awaitIfPaused()` una vez por iteración; si el juego está pausado, se bloquea de verdad con `wait()` hasta `resume()` |
+| `PauseController.awaitAllParked(timeout)` usado antes de leer estadísticas | *Tearing*: leer el estado de una serpiente que todavía está a mitad de un `step()` cuando se pidió la pausa (la suspensión nunca es instantánea) | Bloquea al hilo que pide las estadísticas hasta que todos los `SnakeRunner` confirman (vía `wait/notify`) que están parqueados; si se agota un timeout razonable, se muestran las estadísticas igual pero con una advertencia explícita, en vez de bloquear indefinidamente |
+| `Board.step(...)` sigue siendo un único método `synchronized`, ahora también detecta colisión contra el cuerpo de cualquier serpiente | Dos serpientes podrían "pisar" la misma celda de forma inconsistente, o dos hilos podrían decidir la muerte de una tercera serpiente en instantes contradictorios | Al serializar el movimiento (una serpiente avanza a la vez dentro de este lock), la comprobación de colisión y el movimiento ocurren de forma atómica. Lo que no está dentro del lock: la decisión de girar al azar y el `Thread.sleep` de cada `SnakeRunner`, para no retener el lock más de lo necesario |
+
+**Justificación del alcance de `Board.step`:** se evaluó partir este
+método en candados más finos, pero se descartó porque (a) el método ya es
+rápido — no hace I/O ni espera —, (b) solo se ejecuta una vez por
+iteración de cada `SnakeRunner`, nunca en un bucle ajustado, y (c) partir
+el lock habría obligado a tomar varios candados en un orden coordinado
+para verificar colisiones contra todas las demás serpientes, aumentando el
+riesgo de interbloqueo sin una ganancia de rendimiento medible a la escala
+de este laboratorio (hasta 40 serpientes probadas).
+
+**Por qué no hay riesgo de deadlock:** dentro de `Board.step` (con el lock
+de `Board` ya tomado) se consulta `other.occupies(...)` de otras
+serpientes, lo cual toma internamente el lock de esa `Snake`. Como `Board`
+permite un único hilo dentro de `step()` a la vez, nunca hay dos hilos
+intentando adquirir el par de locks (Board, Snake) en órdenes distintos al
+mismo tiempo.
+
+### 3.6 UI: Iniciar / Pausar / Reanudar con estadísticas
+
+- El juego inicia automáticamente al abrir la ventana (`clock.start()`,
+  hilos de `SnakeRunner` ya en ejecución).
+- El botón alterna entre **Pausar** y **Reanudar**. Al pausar:
+  1. `pauseController.pause()` marca el estado global.
+  2. Un hilo virtual auxiliar llama a `awaitAllParked(500)` — sin bloquear
+     el hilo de eventos de Swing, para no congelar la ventana.
+  3. Solo cuando retorna (todos parqueados, o venció el timeout) se
+     calculan las estadísticas y se publican de vuelta al hilo de Swing
+     con `invokeLater`.
+- Estadísticas mostradas: **serpiente más larga viva** (recorriendo las
+  vivas y comparando `length()`) y **peor serpiente** (`deathOrder.peek()`,
+  la primera en morir).
 
 ---
 
-## Entregables de este documento
+## 4. Cómo compilar y correr las pruebas
 
-- Código fuente de la Parte II (SnakeRace) en este mismo repositorio.
-- Código fuente de la Parte I (`PrimeFinder.java`) a subir al repositorio
-  indicado para esa parte.
-- Este archivo: **`REPORT.md`**.
+Requisitos: **JDK 21** y **Maven 3.9+** instalados y en el `PATH`.
+
+```bash
+# Compila el proyecto y corre TODAS las pruebas automáticamente
+mvn clean verify
+```
+
+Este comando descarga las dependencias (JUnit 5), compila `src/main` y
+`src/test`, y ejecuta las tres clases de prueba. Debe terminar con
+`BUILD SUCCESS`. La salida detallada de cada prueba queda en
+`target/surefire-reports/`.
+
+Para correr una sola clase de prueba (útil mientras se depura):
+
+```bash
+mvn test -Dtest=BoardConcurrencyTest
+mvn test -Dtest=SnakeThreadSafetyTest
+mvn test -Dtest=PauseControllerTest
+```
+
+Qué verifica cada una:
+
+| Prueba | Qué demuestra |
+|---|---|
+| `SnakeThreadSafetyTest` | Un hilo escribe (`advance`) 20 000 veces mientras otro lee (`snapshot`) simultáneamente sobre la misma serpiente — no debe lanzarse ninguna excepción. |
+| `BoardConcurrencyTest` | 30 serpientes en un tablero pequeño (12×12, colisiones frecuentes) corriendo en hilos virtuales — no debe lanzarse ninguna excepción de concurrencia y todos los hilos deben terminar limpiamente al ser interrumpidos. |
+| `PauseControllerTest` | 8 hilos se registran; el hilo principal pausa y espera a que todos confirmen (`awaitAllParked`); luego reanuda y verifica que todos se desbloqueen y terminen — prueba directa del contrato de `wait/notify` sin *lost wakeups*. |
+
+Para ejecutar el juego una vez compilado:
+
+```bash
+mvn -q -DskipTests exec:java -Dsnakes=4
+mvn -q -DskipTests exec:java -Dsnakes=20
+```
+
+---
+
+## 5. Conclusiones
+
+El starter tenía dos defectos de concurrencia reales (acceso no
+sincronizado al cuerpo de la serpiente, y una pausa que no pausaba nada) y
+carecía de una mecánica de muerte necesaria para las estadísticas pedidas.
+Ambos se corrigieron aplicando el mismo patrón de monitor practicado en la
+Parte I (`synchronized` + `wait/notify`, condición revisada con `while`,
+comprobación y espera siempre atómicas respecto al mismo lock), manteniendo
+las regiones críticas tan pequeñas como el problema lo permite. Las pruebas
+de concurrencia automatizadas y la prueba de carga manual con 40 serpientes
+confirman que el diseño se sostiene bajo estrés sin excepciones ni
+bloqueos.

@@ -3,6 +3,7 @@ package co.eci.snake.ui.legacy;
 import co.eci.snake.concurrency.SnakeRunner;
 import co.eci.snake.core.Board;
 import co.eci.snake.core.Direction;
+import co.eci.snake.core.GameState;
 import co.eci.snake.core.Position;
 import co.eci.snake.core.Snake;
 import co.eci.snake.core.engine.GameClock;
@@ -15,17 +16,32 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * UI Swing con control de ejecución explícito de 3 estados
+ * (STOPPED -> RUNNING -> PAUSED -> RUNNING -> ...), usando el enum
+ * {@link GameState} ya provisto por el starter. A diferencia de la primera
+ * versión, el juego YA NO arranca solo al abrir la ventana: los hilos de
+ * las serpientes (SnakeRunner) y el GameClock solo se inician cuando el
+ * usuario pulsa "Iniciar".
+ */
 public final class SnakeApp extends JFrame {
 
   private final Board board;
   private final GamePanel gamePanel;
-  private final JButton actionButton;
+  private final JButton iniciarButton;
+  private final JButton pausarButton;
+  private final JButton reanudarButton;
   private final JLabel statsLabel;
   private final GameClock clock;
   private final PauseController pauseController = new PauseController();
   private final java.util.List<Snake> snakes = new java.util.ArrayList<>();
+  private final List<Snake> allSnakes;
+  private ExecutorService runnerExecutor;
+  private GameState state = GameState.STOPPED;
+
   /**
    * Cola concurrente no bloqueante (Michael-Scott) que registra el orden en
    * que las serpientes van muriendo. Se usa en lugar de una lista sencilla
@@ -50,16 +66,25 @@ public final class SnakeApp extends JFrame {
     // Vista inmutable: la identidad de la lista no cambia tras arrancar el
     // juego (ninguna serpiente se agrega/quita), solo su estado interno,
     // que cada Snake ya protege con su propio lock.
-    var allSnakes = java.util.List.copyOf(snakes);
+    this.allSnakes = java.util.List.copyOf(snakes);
 
     this.gamePanel = new GamePanel(board, () -> snakes);
-    this.actionButton = new JButton("Pausar");
-    this.statsLabel = new JLabel(" ", SwingConstants.CENTER);
+    this.iniciarButton = new JButton("Iniciar");
+    this.pausarButton = new JButton("Pausar");
+    this.reanudarButton = new JButton("Reanudar");
+    this.statsLabel = new JLabel("Presiona \"Iniciar\" para comenzar", SwingConstants.CENTER);
+
+    pausarButton.setEnabled(false);
+    reanudarButton.setEnabled(false);
 
     setLayout(new BorderLayout());
     add(gamePanel, BorderLayout.CENTER);
+    var buttons = new JPanel(new FlowLayout(FlowLayout.LEFT));
+    buttons.add(iniciarButton);
+    buttons.add(pausarButton);
+    buttons.add(reanudarButton);
     var south = new JPanel(new BorderLayout());
-    south.add(actionButton, BorderLayout.WEST);
+    south.add(buttons, BorderLayout.WEST);
     south.add(statsLabel, BorderLayout.CENTER);
     add(south, BorderLayout.SOUTH);
 
@@ -69,18 +94,17 @@ public final class SnakeApp extends JFrame {
 
     this.clock = new GameClock(60, () -> SwingUtilities.invokeLater(gamePanel::repaint));
 
-    var exec = Executors.newVirtualThreadPerTaskExecutor();
-    for (Snake s : snakes) {
-      exec.submit(new SnakeRunner(s, board, allSnakes, pauseController, deathOrder::add));
-    }
+    iniciarButton.addActionListener((ActionEvent e) -> startGame());
+    pausarButton.addActionListener((ActionEvent e) -> pauseGame());
+    reanudarButton.addActionListener((ActionEvent e) -> resumeGame());
 
-    actionButton.addActionListener((ActionEvent e) -> togglePause());
-
-    gamePanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("SPACE"), "pause");
-    gamePanel.getActionMap().put("pause", new AbstractAction() {
+    gamePanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("SPACE"), "toggle-pause");
+    gamePanel.getActionMap().put("toggle-pause", new AbstractAction() {
       @Override
       public void actionPerformed(ActionEvent e) {
-        togglePause();
+        if (state == GameState.STOPPED) startGame();
+        else if (state == GameState.RUNNING) pauseGame();
+        else if (state == GameState.PAUSED) resumeGame();
       }
     });
 
@@ -149,11 +173,30 @@ public final class SnakeApp extends JFrame {
     }
 
     setVisible(true);
-    clock.start();
   }
 
   /**
-   * Al pausar: primero se marca el estado como PAUSED (pauseController +
+   * "Iniciar": lanza recién ahora los hilos SnakeRunner (uno por serpiente,
+   * en hilos virtuales) y arranca el GameClock. Antes de este clic el
+   * tablero se muestra estático (sin movimiento), cumpliendo el requisito
+   * de un control de ejecución explícito Iniciar / Pausar / Reanudar.
+   */
+  private void startGame() {
+    if (state != GameState.STOPPED) return;
+    runnerExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    for (Snake s : snakes) {
+      runnerExecutor.submit(new SnakeRunner(s, board, allSnakes, pauseController, deathOrder::add));
+    }
+    clock.start();
+    state = GameState.RUNNING;
+    statsLabel.setText(" ");
+    iniciarButton.setEnabled(false);
+    pausarButton.setEnabled(true);
+    reanudarButton.setEnabled(false);
+  }
+
+  /**
+   * "Pausar": primero se marca el estado como PAUSED (pauseController +
    * clock), y luego -en un hilo virtual aparte, para no bloquear el EDT- se
    * espera a que TODOS los SnakeRunner confirmen que ya están parqueados
    * (awaitAllParked). Solo entonces se calculan y publican las estadísticas
@@ -161,32 +204,37 @@ public final class SnakeApp extends JFrame {
    * espera, se podría leer el largo de una serpiente que en ese instante
    * todavía está a mitad de un step().
    */
-  private void togglePause() {
-    if ("Pausar".equals(actionButton.getText())) {
-      actionButton.setText("Reanudar");
-      actionButton.setEnabled(false);
-      clock.pause();
-      pauseController.pause();
-      Thread.ofVirtual().start(() -> {
-        boolean allParked;
-        try {
-          allParked = pauseController.awaitAllParked(500);
-        } catch (InterruptedException ie) {
-          Thread.currentThread().interrupt();
-          allParked = false;
-        }
-        boolean finalAllParked = allParked;
-        SwingUtilities.invokeLater(() -> {
-          statsLabel.setText(buildStats(finalAllParked));
-          actionButton.setEnabled(true);
-        });
+  private void pauseGame() {
+    if (state != GameState.RUNNING) return;
+    state = GameState.PAUSED;
+    clock.pause();
+    pauseController.pause();
+    pausarButton.setEnabled(false);
+    reanudarButton.setEnabled(false);
+    Thread.ofVirtual().start(() -> {
+      boolean allParked;
+      try {
+        allParked = pauseController.awaitAllParked(500);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        allParked = false;
+      }
+      boolean finalAllParked = allParked;
+      SwingUtilities.invokeLater(() -> {
+        statsLabel.setText(buildStats(finalAllParked));
+        reanudarButton.setEnabled(true);
       });
-    } else {
-      actionButton.setText("Pausar");
-      statsLabel.setText(" ");
-      pauseController.resume();
-      clock.resume();
-    }
+    });
+  }
+
+  private void resumeGame() {
+    if (state != GameState.PAUSED) return;
+    state = GameState.RUNNING;
+    statsLabel.setText(" ");
+    pauseController.resume();
+    clock.resume();
+    pausarButton.setEnabled(true);
+    reanudarButton.setEnabled(false);
   }
 
   private String buildStats(boolean consistent) {

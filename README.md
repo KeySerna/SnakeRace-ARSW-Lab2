@@ -24,7 +24,7 @@ mvn -q -DskipTests exec:java -Dsnakes=4
 - **Controles**:
   - **Flechas**: serpiente **0** (Jugador 1).
   - **WASD**: serpiente **1** (si existe).
-  - **Espacio** o botón **Action**: Pausar / Reanudar.
+  - **Botones Iniciar / Pausar / Reanudar** (abajo a la izquierda) o **Espacio** (alterna según el estado actual).
 
 ---
 
@@ -161,5 +161,5 @@ Las respuestas y el análisis de concurrencia (data races encontradas, coleccion
 - `Board`: `step(...)` ahora también detecta colisión contra el cuerpo de cualquier serpiente (propia o ajena) y retorna `DIED`.
 - Nuevo `PauseController` (`core/engine`): coordina pausa/reanudación real de los `SnakeRunner` con `synchronized`/`wait()`/`notifyAll()`, sin espera activa.
 - `SnakeRunner`: ahora sí respeta la pausa (antes el botón "Action" solo detenía el repintado, no el movimiento) y reporta la muerte de su serpiente.
-- `SnakeApp`: botón **Pausar/Reanudar** espera a que todos los hilos confirmen estar detenidos antes de mostrar estadísticas (serpiente más larga viva y primera en morir), evitando "tearing".
+- `SnakeApp`: ahora tiene **3 botones explícitos — Iniciar / Pausar / Reanudar** — controlados por el estado del juego (`GameState`: STOPPED/RUNNING/PAUSED). Las serpientes ya no se mueven solas al abrir la ventana: solo arrancan al pulsar "Iniciar". Al pausar, se espera a que todos los hilos confirmen estar detenidos antes de mostrar estadísticas (serpiente más larga viva y primera en morir), evitando "tearing".
 - Pruebas de concurrencia en `src/test/java` (`BoardConcurrencyTest`, `SnakeThreadSafetyTest`, `PauseControllerTest`).
