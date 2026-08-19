@@ -7,7 +7,8 @@ Alumnos:
 Keyla Yunuette Serna Illescas
 
 Esteban Valente Arenas
-
+   ## Reporte de laboratorio
+   Ver `Reporte_Laboratorio2_ARSW.pdf` en la raíz de este repositorio.
 ---
 
 ## Requisitos
