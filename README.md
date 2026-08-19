@@ -3,6 +3,11 @@
 **Escuela Colombiana de Ingeniería – Arquitecturas de Software**  
 Laboratorio de programación concurrente: condiciones de carrera, sincronización y colecciones seguras.
 
+Alumnos: 
+Keyla Yunuette Serna Illescas
+
+Esteban Valente Arenas
+
 ---
 
 ## Requisitos
