@@ -159,7 +159,7 @@ Este laboratorio es una adaptación modernizada del ejercicio **SnakeRace** de A
 
 ## Reporte de laboratorio
 
-Las respuestas y el análisis de concurrencia (data races encontradas, colecciones inseguras, esperas activas eliminadas, regiones críticas y su justificación, diseño de Pausar/Reanudar) están en **[`REPORT.md`](./REPORT.md)**.
+Las respuestas y el análisis de concurrencia (data races encontradas, colecciones inseguras, esperas activas eliminadas, regiones críticas y su justificación, diseño de Pausar/Reanudar) están en **[`Reporte_Laboratorio2_ARSW`](./Reporte_Laboratorio2_ARSW.pdf)**.
 
 ## Cambios respecto al starter (resumen)
 
